@@ -1,0 +1,14 @@
+[package]
+name = "rustos-build"
+version = "0.1.0"
+edition = "2021"
+description = "RustOS build orchestrator (xtask): discovers sibling RustOS repos, runs cargo test in dependency order, builds kernel+image, prints a summary table (std-only)"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rustos-build"
+path = "src/main.rs"
+
+[lib]
+name = "rustos_build"
+path = "src/lib.rs"
