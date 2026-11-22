@@ -28,6 +28,10 @@ pub const REPO_ORDER: &[&str] = &[
     "rustos-image",
     "rustos-runner",
     "rustos-shell",
+    "rustos-power",
+    "rustos-users",
+    "rustos-libc",
+    "rustos-installer",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,7 +331,7 @@ mod tests {
             .map(|n| RepoResult::skipped(n, Path::new("/none")))
             .collect();
         assert!(!any_failed(&all_skip));
-        assert!(format_summary(&all_skip).contains("skipped: 18"));
+        assert!(format_summary(&all_skip).contains("skipped: 22"));
     }
 
     #[test]

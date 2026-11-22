@@ -13,9 +13,17 @@ fn usage() -> &'static str {
      rustos-build test [--root <dir>]\n  \
      rustos-build build [--root <dir>] [--size-mb 64]\n  \
      rustos-build image [--root <dir>] [--kernel <elf>] [--size-mb 64]\n  \
-     rustos-build run [--root <dir>] [--image <disk.img>] [--timeout 10]\n  \
+     rustos-build run [--root <dir>] [--image <disk.img>] [--timeout 10] \\\n      \
+     [--ovmf] [--ovmf-code <path>] [--ovmf-vars <path>]\n  \
      rustos-build clean [--root <dir>]\n\n\
-     Default --root is the parent of this repo (the rust-os/ dir).\n"
+     Default --root is the parent of this repo (the rust-os/ dir).\n\n\
+     `image`/`build` produce a BOOTABLE UEFI/GPT disk via\n  \
+     rustos-bootloader: the ESP holds efi/boot/bootx64.efi, the kernel\n  \
+     (kernel-x86_64) and boot.json. Without rustos-bootloader present\n  \
+     they fall back to rustos-image, whose ESP holds only the kernel\n  \
+     and is NOT UEFI-bootable. Boot the image with OVMF (see\n  \
+     rustos-bootloader README for the exact QEMU command), or\n  \
+     `rustos-build run --ovmf` to boot it under QEMU via rustos-run.\n"
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -55,31 +63,85 @@ fn do_test(root: &Path) -> (Vec<RepoResult>, bool) {
     (results, failed)
 }
 
-/// Build a disk image via rustos-image (if present).
+/// Build a bootable disk image.
+/// The bootable path uses `rustos-bootloader` (if present): its CLI
+/// wraps the `bootloader` crate's `DiskImageBuilder`, which embeds
+/// `efi/boot/bootx64.efi` + the kernel + `boot.json` on a GPT disk —
+/// the image OVMF boots without intervention. Only when that repo is
+/// missing do we fall back to `rustos-image`, whose ESP holds just
+/// the kernel file and is NOT UEFI-bootable on its own (it is a
+/// correctly partitioned container, not a bootable disk).
 /// Returns a RepoResult named "image".
 fn do_image(root: &Path, kernel_arg: Option<&str>, size_mb: u64) -> RepoResult {
     let repos = discover_repos(root);
-    let Some(image_repo) = repo(&repos, "rustos-image") else {
-        return RepoResult::skipped("image", &root.join("rustos-image"));
-    };
-    if !image_repo.present {
-        return RepoResult::skipped("image", &image_repo.path);
-    }
-    // Resolve the kernel: explicit --kernel, else a built kernel binary,
-    // else a generated placeholder kernel (demoable without a kernel repo).
-    let kernel_path: PathBuf = if let Some(k) = kernel_arg {
-        PathBuf::from(k)
+    // Resolve the kernel: explicit --kernel, else a built kernel binary.
+    // The kernel builds for x86_64-unknown-none (see its .cargo/config),
+    // so the binary lives under target/x86_64-unknown-none/debug/;
+    // the plain target/debug/ path is kept as a fallback.
+    let kernel_path: Option<PathBuf> = if let Some(k) = kernel_arg {
+        Some(PathBuf::from(k))
     } else {
-        let built = root
-            .join("rustos-kernel/target/debug/rustos-kernel");
-        if built.is_file() {
-            built
+        let triple = root.join("rustos-kernel/target/x86_64-unknown-none/debug/rustos-kernel");
+        let plain = root.join("rustos-kernel/target/debug/rustos-kernel");
+        if triple.is_file() {
+            Some(triple)
+        } else if plain.is_file() {
+            Some(plain)
         } else {
+            None
+        }
+    };
+    let out = root.join("disk.img");
+    let out_s = out.to_string_lossy().into_owned();
+    if let Some(boot) = repo(&repos, "rustos-bootloader") {
+        if boot.present {
+            // The bootloader path validates the ELF, so a placeholder
+            // fake kernel cannot be used here: a missing kernel is a
+            // clear failure, not a silently unbootable image.
+            let Some(kernel_path) = kernel_path else {
+                return RepoResult::fail(
+                    "image",
+                    "kernel not found: build rustos-kernel first, or pass --kernel <elf>",
+                );
+            };
+            let kernel_s = kernel_path.to_string_lossy().into_owned();
+            return match run_command(
+                &boot.path,
+                "cargo",
+                &["run", "--quiet", "--", "--kernel", &kernel_s, "--out", &out_s],
+            ) {
+                Ok((true, tail)) => RepoResult::pass(
+                    "image",
+                    &format!(
+                        "bootable UEFI/GPT {} via rustos-bootloader ({}; --size-mb ignored: sized from content)",
+                        out.display(),
+                        tail.lines().next().unwrap_or("").trim()
+                    ),
+                ),
+                Ok((false, tail)) => RepoResult::fail(
+                    "image",
+                    &format!(
+                        "rustos-bootloader failed: {}",
+                        tail.lines().last().unwrap_or("").trim()
+                    ),
+                ),
+                Err(e) => RepoResult::fail("image", &e),
+            };
+        }
+    }
+    // Fallback: rustos-image only (kernel-only ESP, not UEFI-bootable).
+    let image_repo = match repo(&repos, "rustos-image") {
+        Some(r) if r.present => r,
+        _ => return RepoResult::skipped("image", &root.join("rustos-image")),
+    };
+    let kernel_path: PathBuf = match kernel_path {
+        Some(k) => k,
+        None => {
+            // No kernel repo: generated placeholder, demoable only.
             let tmp = std::env::temp_dir().join(format!(
                 "rustos-placeholder-kernel-{}.efi",
                 std::process::id()
             ));
-            // Minimal fake kernel: ELF magic + filler.
             let mut data = vec![0x7F, b'E', b'L', b'F', 2, 1, 1, 0];
             data.resize(4096, 0xAA);
             if std::fs::write(&tmp, &data).is_err() {
@@ -94,10 +156,8 @@ fn do_image(root: &Path, kernel_arg: Option<&str>, size_mb: u64) -> RepoResult {
             &format!("kernel not found: {}", kernel_path.display()),
         );
     }
-    let out = root.join("disk.img");
     let size = size_mb.to_string();
     let kernel_s = kernel_path.to_string_lossy().into_owned();
-    let out_s = out.to_string_lossy().into_owned();
     match run_command(
         &image_repo.path,
         "cargo",
@@ -116,7 +176,12 @@ fn do_image(root: &Path, kernel_arg: Option<&str>, size_mb: u64) -> RepoResult {
     ) {
         Ok((true, _)) => RepoResult::pass(
             "image",
-            &format!("built {} ({} MiB) from {}", out.display(), size_mb, kernel_path.display()),
+            &format!(
+                "built {} ({} MiB) from {} via rustos-image (kernel-only ESP: NOT UEFI-bootable, use rustos-bootloader)",
+                out.display(),
+                size_mb,
+                kernel_path.display()
+            ),
         ),
         Ok((false, tail)) => RepoResult::fail("image", &format!("rustos-image failed: {}", tail.lines().last().unwrap_or("").trim())),
         Err(e) => RepoResult::fail("image", &e),
@@ -205,16 +270,34 @@ fn main() -> ExitCode {
                 let to_s = timeout.to_string();
                 let log = root.join("serial.log");
                 let log_s = log.to_string_lossy().into_owned();
-                match run_command(
-                    &runner.unwrap().path,
-                    "cargo",
-                    &[
-                        "run", "--quiet", "--", "run",
-                        "--image", &img_s,
-                        "--timeout", &to_s,
-                        "--serial-log", &log_s,
-                    ],
-                ) {
+                let mut run_args: Vec<String> = vec![
+                    "run".to_string(),
+                    "--quiet".to_string(),
+                    "--".to_string(),
+                    "run".to_string(),
+                    "--image".to_string(),
+                    img_s,
+                    "--timeout".to_string(),
+                    to_s,
+                    "--serial-log".to_string(),
+                    log_s,
+                ];
+                // UEFI boot: forward --ovmf (and any explicit firmware
+                // paths) to the runner; without it QEMU boots SeaBIOS.
+                if rest.iter().any(|a| a == "--ovmf") {
+                    run_args.push("--ovmf".to_string());
+                }
+                if let Some(c) = flag(rest, "--ovmf-code") {
+                    run_args.push("--ovmf-code".to_string());
+                    run_args.push(c);
+                }
+                if let Some(v) = flag(rest, "--ovmf-vars") {
+                    run_args.push("--ovmf-vars".to_string());
+                    run_args.push(v);
+                }
+                let run_refs: Vec<&str> =
+                    run_args.iter().map(|s| s.as_str()).collect();
+                match run_command(&runner.unwrap().path, "cargo", &run_refs) {
                     Ok((ok, tail)) => {
                         println!("{}", tail.lines().last().unwrap_or(""));
                         if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
