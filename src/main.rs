@@ -2,7 +2,7 @@
 
 use rustos_build::{
     any_failed, cargo_build, cargo_clean, cargo_test, discover_repos, find_on_path,
-    format_summary, run_command, RepoResult, StepStatus, REPO_ORDER,
+    format_summary, run_command, verify_program_allocator, RepoResult, StepStatus, REPO_ORDER,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -216,6 +216,40 @@ fn main() -> ExitCode {
             let (mut results, failed) = do_test(&root);
             if !failed {
                 let repos = discover_repos(&root);
+                // rustos-hello and rustos-sh FIRST: the kernel's
+                // build.rs embeds both ELFs, so the kernel build
+                // must find freshly built program binaries
+                // (otherwise it embeds empty placeholders and boots
+                // without userspace).
+                if let Some(hello) = repo(&repos, "rustos-hello") {
+                    if hello.present {
+                        println!("building rustos-hello ...");
+                        let r = cargo_build(hello);
+                        let ok = r.status == StepStatus::Pass;
+                        results.push(r);
+                        if ok {
+                            // The allocator wiring check (Batch 9
+                            // exit(1) bug): the shipped binary must
+                            // contain exactly one RustosAlloc static
+                            // (libc's ALLOCATOR) — a program-local
+                            // ALLOC would fail every allocation.
+                            println!("verifying rustos-hello allocator wiring ...");
+                            results.push(verify_program_allocator(hello, "hello"));
+                        }
+                    }
+                }
+                if let Some(sh) = repo(&repos, "rustos-sh") {
+                    if sh.present {
+                        println!("building rustos-sh ...");
+                        let r = cargo_build(sh);
+                        let ok = r.status == StepStatus::Pass;
+                        results.push(r);
+                        if ok {
+                            println!("verifying rustos-sh allocator wiring ...");
+                            results.push(verify_program_allocator(sh, "sh"));
+                        }
+                    }
+                }
                 if let Some(kernel) = repo(&repos, "rustos-kernel") {
                     if kernel.present {
                         println!("building rustos-kernel ...");

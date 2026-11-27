@@ -12,6 +12,12 @@ use std::process::Command;
 pub const REPO_ORDER: &[&str] = &[
     "rustos-toolchain",
     "rustos-bootloader",
+    // The framebuffer console (Batch 10): pixel drawing (rustos-fb)
+    // plus the terminal layer (rustos-tty) the kernel mirrors its
+    // console output through — before the kernel, which depends on
+    // both.
+    "rustos-fb",
+    "rustos-tty",
     "rustos-kernel",
     "rustos-memory",
     "rustos-drivers",
@@ -31,6 +37,14 @@ pub const REPO_ORDER: &[&str] = &[
     "rustos-power",
     "rustos-users",
     "rustos-libc",
+    // The first userspace program (Batch 8): depends on rustos-libc,
+    // and the kernel's build.rs embeds its ELF — so it must be
+    // built BEFORE the kernel in the `build` flow (see main.rs).
+    "rustos-hello",
+    // The userspace shell (Batch 9): same shape as rustos-hello —
+    // depends on rustos-libc, embedded by the kernel's build.rs,
+    // built BEFORE the kernel.
+    "rustos-sh",
     "rustos-installer",
 ];
 
@@ -191,10 +205,15 @@ pub fn run_command(dir: &Path, program: &str, args: &[&str]) -> Result<(bool, St
 /// (`x86_64-unknown-none` in its `.cargo/config.toml`), which has no `std`
 /// or test harness, so its host unit tests must name the host target
 /// explicitly: `cargo test --target x86_64-unknown-linux-gnu`.
-/// Every other repo tests with plain `cargo test`.
+/// `rustos-hello` and `rustos-sh` have the same shape (a
+/// `.cargo/config.toml` pinning `x86_64-unknown-none` for the program
+/// binary, while their lib tests need `std`), so they get the same
+/// special case. Every other repo tests with plain `cargo test`.
 pub fn test_args_for(name: &str) -> Vec<&'static str> {
     match name {
-        "rustos-kernel" => vec!["test", "--quiet", "--target", "x86_64-unknown-linux-gnu"],
+        "rustos-kernel" | "rustos-hello" | "rustos-sh" => {
+            vec!["test", "--quiet", "--target", "x86_64-unknown-linux-gnu"]
+        }
         _ => vec!["test", "--quiet"],
     }
 }
@@ -241,6 +260,132 @@ pub fn cargo_clean(repo: &RepoInfo) -> RepoResult {
             &format!("cargo clean failed: {}", last_line(&out)),
         ),
         Err(e) => RepoResult::fail(&repo.name, &e),
+    }
+}
+
+/// Check `nm` output for the allocator-wiring invariant of a
+/// userspace program binary: exactly one `RustosAlloc` static —
+///
+/// rustos-libc's `ALLOCATOR` — and no program-local `ALLOC`.
+///
+/// Why this exists (Batch 9 live boot, 2026-11-22): both user
+/// programs exited 1 before printing anything. `start()` had
+/// installed the heap into libc's `ALLOCATOR`, but each program
+/// declared its own `#[global_allocator] static ALLOC` — a second,
+/// never-initialised `RustosAlloc` — and `format!` allocates
+/// through the global allocator, so the first print failed every
+/// allocation, panicked, and exited 1. The fix is one allocator:
+/// libc's `ALLOCATOR` carries `#[global_allocator]` on freestanding
+/// targets and programs declare none. Host unit tests cannot see
+/// that wiring (they build for the host target, where the
+/// attribute is off), so this check reads the shipped binary's
+/// symbol table instead: a program-local `ALLOC` static in the
+/// freestanding ELF means the bug is back.
+///
+/// `nm` prints one symbol per line: `<address> <type> <name>`.
+/// Only data/bss statics (types `b`/`B`/`d`/`D`/`r`/`R`) can be
+/// allocator instances; function symbols (`t`/`T`, e.g.
+/// `RustosAlloc::init`, `GlobalAlloc::alloc`) are ignored. The
+/// check is pure over the output, so unit tests can drive it with
+/// sample `nm` text.
+pub fn check_allocator_symbols(nm_output: &str) -> Result<(), String> {
+    let mut allocator = 0usize;
+    let mut local_alloc = Vec::new();
+    let mut other_alloc_statics = Vec::new();
+    for line in nm_output.lines() {
+        let mut parts = line.split_whitespace();
+        let (_addr, ty, name) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(a), Some(t), Some(n)) => (a, t, n),
+            _ => continue,
+        };
+        if !matches!(ty, "b" | "B" | "d" | "D" | "r" | "R") {
+            continue;
+        }
+        if !name.contains("ALLOC") {
+            continue;
+        }
+        if name.contains("9ALLOCATOR") {
+            allocator += 1;
+        } else if name.ends_with("5ALLOC") {
+            local_alloc.push(name.to_string());
+        } else {
+            other_alloc_statics.push(name.to_string());
+        }
+    }
+    if allocator != 1 {
+        return Err(format!(
+            "expected exactly one rustos-libc ALLOCATOR static, found {}",
+            allocator
+        ));
+    }
+    if !local_alloc.is_empty() {
+        return Err(format!(
+            "program-local #[global_allocator] ALLOC static(s) present ({}): \
+             start() initialises libc's ALLOCATOR, but format!/Vec/String \
+             allocate through the program's own never-initialised ALLOC — \
+             the Batch 9 exit(1) bug",
+            local_alloc.join(", ")
+        ));
+    }
+    if !other_alloc_statics.is_empty() {
+        return Err(format!(
+            "unexpected RustosAlloc static(s): {}",
+            other_alloc_statics.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Verify a userspace program binary's allocator wiring with `nm`:
+/// the freestanding ELF at
+/// `<repo>/target/x86_64-unknown-none/debug/<bin>` must contain
+/// exactly one `RustosAlloc` static (libc's `ALLOCATOR`) — see
+/// [`check_allocator_symbols`]. Missing repo/binary: SKIPPED.
+/// `nm` not on PATH, or the check failing: FAIL.
+pub fn verify_program_allocator(repo: &RepoInfo, bin: &str) -> RepoResult {
+    let name = format!("{}-allocator", repo.name);
+    if !repo.present {
+        return RepoResult::skipped(&name, &repo.path);
+    }
+    let binary = repo
+        .path
+        .join("target")
+        .join("x86_64-unknown-none")
+        .join("debug")
+        .join(bin);
+    if !binary.is_file() {
+        return RepoResult::skipped(&name, &binary);
+    }
+    let Some(nm) = find_on_path("nm") else {
+        return RepoResult::fail(
+            &name,
+            "nm not found on PATH (binutils is required to verify the allocator wiring)",
+        );
+    };
+    let output = std::process::Command::new(nm)
+        .arg(&binary)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            return RepoResult::fail(
+                &name,
+                &format!(
+                    "nm failed on {}: {}",
+                    binary.display(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            );
+        }
+        Err(e) => return RepoResult::fail(&name, &format!("failed to spawn nm: {}", e)),
+    };
+    match check_allocator_symbols(&output) {
+        Ok(()) => RepoResult::pass(
+            &name,
+            "one RustosAlloc static (libc ALLOCATOR), no program-local ALLOC",
+        ),
+        Err(e) => RepoResult::fail(&name, &e),
     }
 }
 
@@ -331,13 +476,24 @@ mod tests {
             .map(|n| RepoResult::skipped(n, Path::new("/none")))
             .collect();
         assert!(!any_failed(&all_skip));
-        assert!(format_summary(&all_skip).contains("skipped: 22"));
+        // Derived, not hardcoded: Batch 9 added rustos-sh as the
+        // 24th repo and the old literal "23" went stale (the suite
+        // then failed on a count, not on behaviour).
+        assert!(format_summary(&all_skip).contains(&format!("skipped: {}", REPO_ORDER.len())));
     }
 
     #[test]
-    fn kernel_test_uses_host_target() {
+    fn kernel_and_hello_tests_use_host_target() {
         assert_eq!(
             test_args_for("rustos-kernel"),
+            vec!["test", "--quiet", "--target", "x86_64-unknown-linux-gnu"]
+        );
+        // rustos-hello pins the bare-metal target for its binary,
+        // so its lib tests need the host target too (plain
+        // `cargo test` there fails: no `std` on
+        // x86_64-unknown-none).
+        assert_eq!(
+            test_args_for("rustos-hello"),
             vec!["test", "--quiet", "--target", "x86_64-unknown-linux-gnu"]
         );
         assert_eq!(test_args_for("rustos-fs"), vec!["test", "--quiet"]);
@@ -379,5 +535,77 @@ mod tests {
         assert!(r.detail.contains("missing"));
         assert_eq!(cargo_build(&repo).status, StepStatus::Skipped);
         assert_eq!(cargo_clean(&repo).status, StepStatus::Skipped);
+    }
+
+    /// Sample `nm` output for a FIXED userspace program binary:
+    /// exactly one `RustosAlloc` static (libc's ALLOCATOR). The
+    /// function symbols that mention `RustosAlloc`/`GlobalAlloc`
+    /// must be ignored — only data/bss statics count.
+    const NM_FIXED: &str = "\
+0000000000400150 t _RNvCs5fGHjzWXRav_7___rustc12___rust_alloc
+0000000000401e70 T _RNvMs0_NtCs7h9ePDcZgSm_11rustos_libc4heapNtB5_11RustosAlloc4init
+0000000000402090 T _RNvXs2_NtCs7h9ePDcZgSm_11rustos_libc4heapNtB5_11RustosAllocNtNtNtCsbQJWu2zlgTK_4core5alloc6global11GlobalAlloc5alloc
+0000000000407ec8 B _RNvNtCs7h9ePDcZgSm_11rustos_libc4heap9ALLOCATOR
+0000000000400000 T _start
+";
+
+    /// The same, but as the Batch 9 live boot shipped it: the
+    /// program's own never-initialised `ALLOC` beside libc's
+    /// `ALLOCATOR` — `format!` allocated through the dead one and
+    /// both programs exited 1 before printing anything.
+    const NM_BROKEN: &str = "\
+0000000000400150 t _RNvCs5fGHjzWXRav_7___rustc12___rust_alloc
+0000000000401e70 T _RNvMs0_NtCs7h9ePDcZgSm_11rustos_libc4heapNtB5_11RustosAlloc4init
+0000000000407ea0 b _RNvCskjHm0zGAuJv_5hello5ALLOC
+0000000000407ec8 B _RNvNtCs7h9ePDcZgSm_11rustos_libc4heap9ALLOCATOR
+0000000000400000 T _start
+";
+
+    #[test]
+    fn allocator_wiring_accepts_the_single_allocator_binary() {
+        assert_eq!(check_allocator_symbols(NM_FIXED), Ok(()));
+    }
+
+    #[test]
+    fn allocator_wiring_rejects_a_program_local_alloc() {
+        let err = check_allocator_symbols(NM_BROKEN).unwrap_err();
+        assert!(err.contains("program-local"), "{err}");
+        assert!(err.contains("5hello5ALLOC"), "{err}");
+    }
+
+    #[test]
+    fn allocator_wiring_rejects_a_missing_allocator() {
+        let none = "0000000000400000 T _start\n";
+        let err = check_allocator_symbols(none).unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+        // Two ALLOCATOR statics is just as wrong as none: there
+        // must be exactly one instance for start() to initialise.
+        let two = format!("{NM_FIXED}0000000000407f00 B _RNvNtCs7h9ePDcZgSm_11rustos_libc4heap9ALLOCATOR\n");
+        let err = check_allocator_symbols(&two).unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn verify_allocator_skips_a_missing_binary() {
+        let repo = RepoInfo {
+            name: "rustos-hello".to_string(),
+            path: PathBuf::from("/nonexistent/rustos-hello"),
+            present: false,
+        };
+        assert_eq!(
+            verify_program_allocator(&repo, "hello").status,
+            StepStatus::Skipped
+        );
+        let repo = RepoInfo {
+            name: "rustos-hello".to_string(),
+            path: tmp_root(),
+            present: true,
+        };
+        // Present repo, no freestanding binary built yet.
+        assert_eq!(
+            verify_program_allocator(&repo, "hello").status,
+            StepStatus::Skipped
+        );
+        let _ = fs::remove_dir_all(&repo.path);
     }
 }
